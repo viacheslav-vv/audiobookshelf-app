@@ -18,7 +18,19 @@ class SyncOutcomeTest {
 
   @Test
   fun rejectedOrUnsentIsNotApplied() {
-    assertEquals(SyncOutcome.NOT_APPLIED, syncOutcomeOf("Unexpected code 500", true))
+    assertEquals(SyncOutcome.NOT_APPLIED, syncOutcomeOf("Unexpected code 401", true))
+    assertEquals(SyncOutcome.NOT_APPLIED, syncOutcomeOf("Request cancelled", true))
+  }
+
+  @Test
+  fun onlyClientErrorsProveTheSyncWasNotApplied() {
+    assertTrue(isRejectedBeforeApplying(401))
+    assertTrue(isRejectedBeforeApplying(404))
+    // The server or a proxy can fail after the update was saved
+    assertFalse(isRejectedBeforeApplying(500))
+    assertFalse(isRejectedBeforeApplying(502))
+    assertFalse(isRejectedBeforeApplying(504))
+    assertEquals(SyncOutcome.UNKNOWN, syncOutcomeOf("Unexpected code 502", false))
   }
 
   @Test

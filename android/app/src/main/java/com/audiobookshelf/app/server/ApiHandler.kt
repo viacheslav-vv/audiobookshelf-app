@@ -42,9 +42,9 @@ import java.util.concurrent.TimeUnit
  */
 enum class SyncOutcome {
   APPLIED,
-  /** The request never reached the server, or the server rejected it */
+  /** The request never reached the server, or the server rejected it before applying it (4xx) */
   NOT_APPLIED,
-  /** Failed after the request may have been sent, e.g. a timeout or dropped connection */
+  /** Failed after the request may have been applied, e.g. a timeout, dropped connection or 5xx */
   UNKNOWN
 }
 
@@ -57,6 +57,13 @@ internal fun IOException.isBeforeRequestSent() =
                 this is UnknownHostException ||
                 this is NoRouteToHostException ||
                 this is SSLHandshakeException
+
+/**
+ * Whether an error status means the server rejected the request without changing anything. 4xx
+ * (auth, not found, bad request) are returned before a sync is applied. A 5xx can come after the
+ * update was saved, e.g. from a proxy timing out, so it does not prove the sync was not applied.
+ */
+internal fun isRejectedBeforeApplying(statusCode: Int) = statusCode in 400..499
 
 /**
  * Outcome of a sync request from its error result. Sync responses carry no data the app needs, so
@@ -204,7 +211,7 @@ class ApiHandler(var ctx:Context) {
           if (!it.isSuccessful) {
             val jsobj = JSObject()
             jsobj.put("error", "Unexpected code $response")
-            jsobj.put(NOT_APPLIED_KEY, true) // Rejected by the server
+            if (isRejectedBeforeApplying(it.code)) jsobj.put(NOT_APPLIED_KEY, true)
             cb(jsobj)
             return
           }
@@ -483,7 +490,7 @@ class ApiHandler(var ctx:Context) {
               AbsLogger.error(tag, "retryOriginalRequest: Retry request failed with status ${it.code} for server ${DeviceManager.serverConnectionConfigString}")
               val errorObj = JSObject()
               errorObj.put("error", "Retry request failed with status ${it.code}")
-              errorObj.put(NOT_APPLIED_KEY, true) // Rejected by the server
+              if (isRejectedBeforeApplying(it.code)) errorObj.put(NOT_APPLIED_KEY, true)
               callback(errorObj)
               return
             }
