@@ -30,7 +30,44 @@ import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.UnknownHostException
+import javax.net.ssl.SSLHandshakeException
 import java.util.concurrent.TimeUnit
+
+/**
+ * Whether the server applied a progress sync. Positions are absolute, but the server adds the
+ * listening time of every sync request, so a sync that may have been applied must not be resent.
+ */
+enum class SyncOutcome {
+  APPLIED,
+  /** The request never reached the server, or the server rejected it */
+  NOT_APPLIED,
+  /** Failed after the request may have been sent, e.g. a timeout or dropped connection */
+  UNKNOWN
+}
+
+// The body is only read after a success status, so this error means the server handled the request
+internal const val RESPONSE_BODY_READ_FAILED = "Failed to read response"
+
+/** Failures that happen before any request data is sent, so the server never saw the request */
+internal fun IOException.isBeforeRequestSent() =
+        this is ConnectException ||
+                this is UnknownHostException ||
+                this is NoRouteToHostException ||
+                this is SSLHandshakeException
+
+/**
+ * Outcome of a sync request from its error result. Sync responses carry no data the app needs, so
+ * a success status whose body could not be read still means the server applied the sync.
+ */
+internal fun syncOutcomeOf(error: String?, notApplied: Boolean): SyncOutcome =
+        when {
+          error.isNullOrEmpty() || error == RESPONSE_BODY_READ_FAILED -> SyncOutcome.APPLIED
+          notApplied -> SyncOutcome.NOT_APPLIED
+          else -> SyncOutcome.UNKNOWN
+        }
 
 /**
  * Cancels a request, including a retry made after a token refresh. Once cancelled, no further call
@@ -66,8 +103,8 @@ class ApiHandler(var ctx:Context) {
       return ::absDatabaseNotifyListeners.isInitialized
     }
 
-    // The body is only read after a success status, so this error means the server handled the request
-    private const val RESPONSE_BODY_READ_FAILED = "Failed to read response"
+    // Set on error results when the request certainly did not change anything on the server
+    private const val NOT_APPLIED_KEY = "notApplied"
 
     // Callbacks waiting on the token refresh in flight, per server connection config id.
     // Shared because several ApiHandler instances exist (player, plugins, downloads).
@@ -141,7 +178,7 @@ class ApiHandler(var ctx:Context) {
 
     val call = client.newCall(request)
     if (cancellation?.track(call) == false) {
-      cb(JSObject().put("error", "Request cancelled"))
+      cb(JSObject().put("error", "Request cancelled").put(NOT_APPLIED_KEY, true))
       return
     }
     call.enqueue(object : Callback {
@@ -151,6 +188,7 @@ class ApiHandler(var ctx:Context) {
 
         val jsobj = JSObject()
         jsobj.put("error", "Failed to connect")
+        if (e.isBeforeRequestSent()) jsobj.put(NOT_APPLIED_KEY, true)
         cb(jsobj)
       }
 
@@ -166,6 +204,7 @@ class ApiHandler(var ctx:Context) {
           if (!it.isSuccessful) {
             val jsobj = JSObject()
             jsobj.put("error", "Unexpected code $response")
+            jsobj.put(NOT_APPLIED_KEY, true) // Rejected by the server
             cb(jsobj)
             return
           }
@@ -238,7 +277,7 @@ class ApiHandler(var ctx:Context) {
       if (result is RefreshResult.Success) {
         retryOriginalRequest(originalRequest, result.accessToken, httpClient, callback, cancellation)
       } else {
-        callback(JSObject().put("error", "Authentication failed - login again"))
+        callback(JSObject().put("error", "Authentication failed - login again").put(NOT_APPLIED_KEY, true))
       }
     }
   }
@@ -424,7 +463,7 @@ class ApiHandler(var ctx:Context) {
       val client = httpClient ?: defaultClient
       val call = client.newCall(newRequest)
       if (cancellation?.track(call) == false) {
-        callback(JSObject().put("error", "Request cancelled"))
+        callback(JSObject().put("error", "Request cancelled").put(NOT_APPLIED_KEY, true))
         return
       }
       call.enqueue(object : Callback {
@@ -433,6 +472,7 @@ class ApiHandler(var ctx:Context) {
           AbsLogger.error(tag, "retryOriginalRequest: Failed to retry request after token refresh for server ${DeviceManager.serverConnectionConfigString} (error: ${e.message})")
           val errorObj = JSObject()
           errorObj.put("error", "Failed to retry request after token refresh")
+          if (e.isBeforeRequestSent()) errorObj.put(NOT_APPLIED_KEY, true)
           callback(errorObj)
         }
 
@@ -443,6 +483,7 @@ class ApiHandler(var ctx:Context) {
               AbsLogger.error(tag, "retryOriginalRequest: Retry request failed with status ${it.code} for server ${DeviceManager.serverConnectionConfigString}")
               val errorObj = JSObject()
               errorObj.put("error", "Retry request failed with status ${it.code}")
+              errorObj.put(NOT_APPLIED_KEY, true) // Rejected by the server
               callback(errorObj)
               return
             }
@@ -705,7 +746,7 @@ class ApiHandler(var ctx:Context) {
     }
   }
 
-  fun sendProgressSync(sessionId:String, syncData: MediaProgressSyncData, cancellation: RequestCancellation? = null, cb: (Boolean, String?) -> Unit) {
+  fun sendProgressSync(sessionId:String, syncData: MediaProgressSyncData, cancellation: RequestCancellation? = null, cb: (SyncOutcome, String?) -> Unit) {
     val payload = JSObject(jacksonMapper.writeValueAsString(syncData))
 
     postRequest("/api/session/$sessionId/sync", payload, null, cancellation) {
@@ -732,7 +773,7 @@ class ApiHandler(var ctx:Context) {
     return json
   }
 
-  fun sendLocalProgressSync(playbackSession:PlaybackSession, cancellation: RequestCancellation? = null, cb: (Boolean, String?) -> Unit) {
+  fun sendLocalProgressSync(playbackSession:PlaybackSession, cancellation: RequestCancellation? = null, cb: (SyncOutcome, String?) -> Unit) {
     val partialSession = createPartialPlaybackSession(playbackSession)
     partialSession.set<ObjectNode>("deviceInfo", jacksonMapper.valueToTree(playbackSession.deviceInfo))
     postRequest("/api/session/local", JSObject(partialSession.toString()), null, cancellation) {
@@ -740,18 +781,10 @@ class ApiHandler(var ctx:Context) {
     }
   }
 
-  /**
-   * Sync responses carry no data the app needs. If the server answered with a success status but the
-   * body could not be read, it did apply the sync: reporting a failure would make the next sync send
-   * the same listening time again.
-   */
-  private fun reportSyncResult(response: JSObject, cb: (Boolean, String?) -> Unit) {
+  private fun reportSyncResult(response: JSObject, cb: (SyncOutcome, String?) -> Unit) {
     val error = response.getString("error")
-    if (error.isNullOrEmpty() || error == RESPONSE_BODY_READ_FAILED) {
-      cb(true, null)
-    } else {
-      cb(false, error)
-    }
+    val outcome = syncOutcomeOf(error, response.optBoolean(NOT_APPLIED_KEY))
+    cb(outcome, if (outcome == SyncOutcome.APPLIED) null else error)
   }
 
   fun updateMediaProgress(libraryItemId:String,episodeId:String?,updatePayload:JSObject, cb: () -> Unit) {

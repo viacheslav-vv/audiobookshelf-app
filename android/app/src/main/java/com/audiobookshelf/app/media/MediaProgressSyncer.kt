@@ -11,6 +11,7 @@ import com.audiobookshelf.app.player.PlayerNotificationService
 import com.audiobookshelf.app.plugins.AbsLogger
 import com.audiobookshelf.app.server.ApiHandler
 import com.audiobookshelf.app.server.RequestCancellation
+import com.audiobookshelf.app.server.SyncOutcome
 import java.util.*
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -94,7 +95,7 @@ class MediaProgressSyncer(
 
   private var lastSyncTime: Long = 0
   @Volatile private var failedSyncs: Int = 0
-  private val unsyncedListeningTime = AtomicLong(0) // seconds from failed server syncs
+  private val unsyncedListeningTime = AtomicLong(0) // seconds from syncs the server did not apply
 
   private val latestServerSyncSeq = AtomicLong(0)
 
@@ -378,7 +379,8 @@ class MediaProgressSyncer(
       }
     } else if (hasNetworkConnection && shouldSyncServer) {
       // Advance the sync time now instead of on success so overlapping syncs don't count the same
-      // listening time twice. Time from failed syncs is carried over in unsyncedListeningTime.
+      // listening time twice. Time from syncs the server did not apply is carried over in
+      // unsyncedListeningTime.
       lastSyncTime += listeningTimeToAdd * 1000L
       val requestSyncData =
               syncData.copy(timeListened = listeningTimeToAdd + unsyncedListeningTime.getAndSet(0))
@@ -413,25 +415,26 @@ class MediaProgressSyncer(
 
   private suspend fun sendSyncRequestOrThrow(request: SyncRequest): SyncResult {
     // The timeout guards the queue: if a callback is ever lost, later syncs must not wait forever
-    val (syncSuccess, errorMsg) =
+    val (outcome, errorMsg) =
             withTimeoutOrNull(SYNC_REQUEST_TIMEOUT_MS) {
-              suspendCancellableCoroutine<Pair<Boolean, String?>> { cont ->
+              suspendCancellableCoroutine<Pair<SyncOutcome, String?>> { cont ->
                 // Cancel the HTTP call on timeout. Otherwise a stalled request could still reach the
                 // server after the next queued sync and overwrite it with an older position.
                 val cancellation = RequestCancellation()
                 cont.invokeOnCancellation { cancellation.cancel() }
                 when (request) {
                   is SyncRequest.Server ->
-                          apiHandler.sendProgressSync(request.sessionId, request.syncData, cancellation) { success, error ->
-                            cont.resume(success to error)
+                          apiHandler.sendProgressSync(request.sessionId, request.syncData, cancellation) { outcome, error ->
+                            cont.resume(outcome to error)
                           }
                   is SyncRequest.Local ->
-                          apiHandler.sendLocalProgressSync(request.session, cancellation) { success, error ->
-                            cont.resume(success to error)
+                          apiHandler.sendLocalProgressSync(request.session, cancellation) { outcome, error ->
+                            cont.resume(outcome to error)
                           }
                 }
               }
-            } ?: (false to "Sync request timed out")
+            } ?: (SyncOutcome.UNKNOWN to "Sync request timed out")
+    val syncSuccess = outcome == SyncOutcome.APPLIED
 
     val sessionId = request.sessionId
     if (request is SyncRequest.Server &&
@@ -446,7 +449,10 @@ class MediaProgressSyncer(
       DeviceManager.dbManager.removePlaybackSession(sessionId) // Remove session from db
       AbsLogger.info("MediaProgressSyncer", "sync: Successfully synced progress (title: \"${request.displayTitle}\") (currentTime: ${request.currentTime}) (session id: $sessionId) (${DeviceManager.serverConnectionConfigName})")
     } else {
-      if (request is SyncRequest.Server && sessionId == currentSessionId) {
+      // The server adds the listening time of every sync it receives and cannot deduplicate, so
+      // only resend it when the request certainly was not applied. After a timeout or dropped
+      // connection the server has usually applied it; the position is resent by the next sync anyway.
+      if (request is SyncRequest.Server && sessionId == currentSessionId && outcome == SyncOutcome.NOT_APPLIED) {
         unsyncedListeningTime.addAndGet(request.syncData.timeListened)
       }
       failedSyncs++
@@ -454,7 +460,7 @@ class MediaProgressSyncer(
         playerNotificationService.alertSyncFailing() // Show alert in client
         failedSyncs = 0
       }
-      AbsLogger.error("MediaProgressSyncer", "sync: Progress sync failed (count: $failedSyncs) (title: \"${request.displayTitle}\") (currentTime: ${request.currentTime}) (session id: $sessionId) (${DeviceManager.serverConnectionConfigName}) (error: $errorMsg)")
+      AbsLogger.error("MediaProgressSyncer", "sync: Progress sync failed (count: $failedSyncs) (title: \"${request.displayTitle}\") (currentTime: ${request.currentTime}) (session id: $sessionId) (${DeviceManager.serverConnectionConfigName}) (outcome: $outcome) (error: $errorMsg)")
     }
     return SyncResult(true, syncSuccess, errorMsg)
   }
