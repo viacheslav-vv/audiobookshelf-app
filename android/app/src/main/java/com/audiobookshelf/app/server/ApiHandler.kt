@@ -42,6 +42,10 @@ class ApiHandler(var ctx:Context) {
     fun checkAbsDatabaseNotifyListenersInitted():Boolean {
       return ::absDatabaseNotifyListeners.isInitialized
     }
+
+    // Callbacks waiting on the token refresh in flight, per server connection config id.
+    // Shared because several ApiHandler instances exist (player, plugins, downloads).
+    private val inFlightRefreshes = HashMap<String, MutableList<(RefreshResult) -> Unit>>()
   }
 
   private var defaultClient = OkHttpClient()
@@ -175,6 +179,17 @@ class ApiHandler(var ctx:Context) {
    */
   private fun handleTokenRefresh(originalRequest: Request, httpClient: OkHttpClient?, callback: (JSObject) -> Unit) {
     val serverConnectionConfigId = DeviceManager.serverConnectionConfigId
+
+    // Another request may have refreshed the token while this one was in flight. Retry with the
+    // new token instead of refreshing again with a refresh token that may already be rotated.
+    val currentToken = DeviceManager.getServerConnectionConfig(serverConnectionConfigId)?.token
+    val sentToken = originalRequest.header("Authorization")?.removePrefix("Bearer ")
+    if (!currentToken.isNullOrEmpty() && sentToken != null && sentToken != currentToken) {
+      AbsLogger.info(tag, "handleTokenRefresh: Token already refreshed, retrying request to \"${originalRequest.url}\"")
+      retryOriginalRequest(originalRequest, currentToken, httpClient, callback)
+      return
+    }
+
     refreshAuthTokens(serverConnectionConfigId, httpClient) { result ->
       if (result is RefreshResult.Success) {
         retryOriginalRequest(originalRequest, result.accessToken, httpClient, callback)
@@ -194,10 +209,36 @@ class ApiHandler(var ctx:Context) {
     data object Transient : RefreshResult
   }
 
-  /** Refreshes tokens for a specific saved server, including downloads queued while another server is active. */
+  /**
+   * Refreshes tokens for a specific saved server, including downloads queued while another server is active.
+   *
+   * Concurrent calls for the same server share one refresh request. The server rotates the refresh
+   * token, so a second parallel refresh with the old token would be rejected and log the user out.
+   */
   fun refreshAuthTokens(
           serverConnectionConfigId: String,
           httpClient: OkHttpClient? = null,
+          onResult: (RefreshResult) -> Unit
+  ) {
+    synchronized(inFlightRefreshes) {
+      val waiting = inFlightRefreshes[serverConnectionConfigId]
+      if (waiting != null) {
+        AbsLogger.info(tag, "refreshAuthTokens: Refresh already in progress for $serverConnectionConfigId, waiting for it")
+        waiting.add(onResult)
+        return
+      }
+      inFlightRefreshes[serverConnectionConfigId] = mutableListOf(onResult)
+    }
+
+    requestTokenRefresh(serverConnectionConfigId, httpClient) { result ->
+      val waiting = synchronized(inFlightRefreshes) { inFlightRefreshes.remove(serverConnectionConfigId) }
+      waiting?.forEach { it(result) }
+    }
+  }
+
+  private fun requestTokenRefresh(
+          serverConnectionConfigId: String,
+          httpClient: OkHttpClient?,
           onResult: (RefreshResult) -> Unit
   ) {
     val config = DeviceManager.getServerConnectionConfig(serverConnectionConfigId)
@@ -668,7 +709,13 @@ class ApiHandler(var ctx:Context) {
         Log.e(tag, "getMediaProgress: Failed to get progress")
         cb(null)
       } else {
-        val progress = jacksonMapper.readValue<MediaProgress>(it.toString())
+        // Callers may be waiting on this to start playback, so a parse error must still call back
+        val progress = try {
+          jacksonMapper.readValue<MediaProgress>(it.toString())
+        } catch (e: Exception) {
+          AbsLogger.error(tag, "getMediaProgress: Invalid progress response (${e.message})")
+          null
+        }
         cb(progress)
       }
     }

@@ -162,6 +162,7 @@ export default {
       playInterval: null,
       trackWidth: 0,
       isPlaying: false,
+      pausedAt: null,
       isEnded: false,
       volume: 0.5,
       readyTrackWidth: 0,
@@ -851,6 +852,7 @@ export default {
     onPlayingUpdate(data) {
       console.log('onPlayingUpdate', JSON.stringify(data))
       this.isPlaying = !!data.value
+      this.pausedAt = this.isPlaying ? null : data.changedAt || Date.now()
       this.$store.commit('setPlayerPlaying', this.isPlaying)
       if (this.isPlaying) {
         this.startPlayInterval()
