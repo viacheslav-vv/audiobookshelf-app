@@ -132,6 +132,50 @@ class ProgressSyncQueueTest {
   }
 
   @Test
+  fun whenIdleRunsAfterPendingSyncs() = runTest {
+    val server = FakeServer()
+    val queue = queue(server)
+    val events = mutableListOf<String>()
+
+    queue.enqueue(serverRequest("s1", 100.0)) { events.add("pause sync") }
+    advanceUntilIdle()
+    queue.whenIdle { events.add("close session") }
+    assertEquals(emptyList<String>(), events)
+
+    server.gates[0].complete(true)
+    advanceUntilIdle()
+    assertEquals(listOf("pause sync", "close session"), events)
+
+    // Idle queue runs the action right away
+    queue.whenIdle { events.add("now") }
+    assertEquals("now", events.last())
+  }
+
+  @Test
+  fun failingCallbackDoesNotStallQueue() = runTest {
+    val server = FakeServer()
+    val errors = mutableListOf<Throwable>()
+    val queue =
+            ProgressSyncQueue<SyncRequest, Boolean>(
+                    TestScope(StandardTestDispatcher(testScheduler)),
+                    SyncRequest::merge,
+                    server::send
+            ) { errors.add(it) }
+    val results = mutableListOf<Boolean>()
+
+    queue.enqueue(serverRequest("s1", 100.0)) { throw IllegalStateException("callback failed") }
+    advanceUntilIdle()
+    queue.enqueue(serverRequest("s2", 5.0)) { results.add(it) }
+    server.gates[0].complete(true)
+    advanceUntilIdle()
+    server.gates[1].complete(true)
+    advanceUntilIdle()
+
+    assertEquals(1, errors.size)
+    assertEquals(listOf(true), results)
+  }
+
+  @Test
   fun mergeRejectsDifferentSessions() {
     val older = serverRequest("s1", 1.0)
     val otherSession = serverRequest("s2", 2.0)

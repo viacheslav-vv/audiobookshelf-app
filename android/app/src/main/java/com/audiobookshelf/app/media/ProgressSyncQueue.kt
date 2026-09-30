@@ -18,12 +18,14 @@ import kotlinx.coroutines.launch
 class ProgressSyncQueue<T, R>(
         private val scope: CoroutineScope,
         private val merge: (older: T, newer: T) -> T?,
-        private val send: suspend (T) -> R
+        private val send: suspend (T) -> R,
+        private val onCallbackError: (Throwable) -> Unit = {}
 ) {
   private class Entry<T, R>(val payload: T, val callbacks: List<(R) -> Unit>)
 
   private val lock = Any()
   private val pending = ArrayDeque<Entry<T, R>>()
+  private val idleActions = mutableListOf<() -> Unit>()
   private var draining = false
 
   fun enqueue(payload: T, onDone: (R) -> Unit) {
@@ -42,13 +44,34 @@ class ProgressSyncQueue<T, R>(
     scope.launch { drain() }
   }
 
+  /** Runs [action] once everything enqueued so far has been sent, right away if the queue is idle. */
+  fun whenIdle(action: () -> Unit) {
+    synchronized(lock) {
+      if (draining) {
+        idleActions.add(action)
+        return
+      }
+    }
+    runCallback { action() }
+  }
+
   private suspend fun drain() {
     while (true) {
+      var actions: List<() -> Unit> = emptyList()
       val entry =
               synchronized(lock) {
-                pending.removeFirstOrNull().also { if (it == null) draining = false }
+                pending.removeFirstOrNull().also {
+                  if (it == null) {
+                    draining = false
+                    actions = idleActions.toList()
+                    idleActions.clear()
+                  }
+                }
               }
-                      ?: return
+      if (entry == null) {
+        actions.forEach { runCallback(it) }
+        return
+      }
 
       val result =
               try {
@@ -58,7 +81,16 @@ class ProgressSyncQueue<T, R>(
                 synchronized(lock) { draining = false }
                 throw e
               }
-      entry.callbacks.forEach { it(result) }
+      entry.callbacks.forEach { callback -> runCallback { callback(result) } }
+    }
+  }
+
+  // A failing callback must not stop the queue or skip the callbacks after it
+  private fun runCallback(callback: () -> Unit) {
+    try {
+      callback()
+    } catch (e: Exception) {
+      onCallbackError(e)
     }
   }
 }

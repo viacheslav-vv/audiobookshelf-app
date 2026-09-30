@@ -852,7 +852,8 @@ export default {
     onPlayingUpdate(data) {
       console.log('onPlayingUpdate', JSON.stringify(data))
       this.isPlaying = !!data.value
-      this.pausedAt = this.isPlaying ? null : data.changedAt || Date.now()
+      // Only set from the native timestamp (Android). A late event would otherwise make the pause look newer than it was
+      this.pausedAt = !this.isPlaying && data.changedAt ? data.changedAt : null
       this.$store.commit('setPlayerPlaying', this.isPlaying)
       if (this.isPlaying) {
         this.startPlayInterval()

@@ -127,6 +127,10 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
   var currentPlaybackSession: PlaybackSession? = null
   private var initialPlaybackRate: Float? = null
 
+  // Play requests waiting on checkServerProgressBeforePlay; bumping the id cancels a waiting play
+  private var playRequestId = 0
+  private var progressCheckPending = false
+
   private val metadataScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
   private var metadataArtJob: Job? = null
 
@@ -450,6 +454,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
     }
 
     isClosed = false
+    cancelPendingPlay()
 
     val mediaItems = playbackSession.getMediaItems(ctx)
     val playbackRateToUse = playbackRate ?: initialPlaybackRate ?: 1f
@@ -700,6 +705,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
   }
 
   fun switchToPlayer(useCastPlayer: Boolean) {
+    cancelPendingPlay()
     val wasPlaying = currentPlayer.isPlaying
     if (useCastPlayer) {
       if (currentPlayer == castPlayer) {
@@ -797,9 +803,6 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
       0
     }
   }
-
-  private var playRequestId = 0
-  private var progressCheckPending = false
 
   fun getCurrentTime(): Long {
     return currentPlayer.currentPosition + getCurrentTrackStartOffsetMs()
@@ -967,15 +970,21 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
   }
 
   fun pause() {
-    playRequestId++ // Cancels a play waiting on checkServerProgressBeforePlay
-    progressCheckPending = false
+    cancelPendingPlay()
     currentPlayer.pause()
+  }
+
+  /** Cancels a play waiting on checkServerProgressBeforePlay */
+  private fun cancelPendingPlay() {
+    playRequestId++
+    progressCheckPending = false
   }
 
   /**
    * Before resuming a paused server stream, check if another device (e.g. the web app) moved the
    * progress while this player was paused, and continue from there. Resuming from the lock screen,
-   * notification or headset never reaches the webview, so this has to happen natively.
+   * media notification or headset never reaches the webview, so this has to happen natively.
+   * (On Android 12 and below the notification play button goes straight to the player instead.)
    *
    * Uses values instead of timestamps so device and server clocks don't matter: if the server
    * still holds the position this device last synced, nobody else changed it.
@@ -986,7 +995,9 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
     val playbackSession = mediaProgressSyncer.currentPlaybackSession ?: return false
     val libraryItemId = playbackSession.libraryItemId
     val pausedAt = mediaProgressSyncer.pausedAt
-    if (playbackSession.isLocal ||
+    // The syncer still holds the previous session until the new one first plays
+    if (playbackSession.id != currentPlaybackSession?.id ||
+                    playbackSession.isLocal ||
                     libraryItemId.isNullOrEmpty() ||
                     mediaProgressSyncer.confirmedServerTime == null ||
                     pausedAt <= 0L ||
@@ -1008,9 +1019,10 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
     val finish = finish@{ mediaProgress: MediaProgress?, timedOut: Boolean ->
       if (handled) return@finish
       handled = true
-      if (requestId != playRequestId) return@finish // Paused (or another play started) meanwhile
+      // Paused, closed or another session prepared meanwhile
+      if (requestId != playRequestId || isClosed) return@finish
       progressCheckPending = false
-      if (currentPlayer.isPlaying) return@finish
+      if (currentPlayer.isPlaying || currentPlaybackSession?.id != playbackSession.id) return@finish
 
       val confirmedTime = mediaProgressSyncer.confirmedServerTime
       if (timedOut) {
@@ -1108,6 +1120,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
 
   fun closePlayback(calledOnError: Boolean? = false) {
     Log.d(tag, "closePlayback")
+    cancelPendingPlay()
     val config = DeviceManager.serverConnectionConfig
 
     val isLocal = mediaProgressSyncer.currentIsLocal
@@ -1126,9 +1139,9 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
           }
         }
       }
-    } else {
-      // If not local session then close on server
-      if (!isLocal && currentSessionId != "") {
+    } else if (!isLocal && currentSessionId != "") {
+      // Close on server once the pause sync, which may still be queued, has been sent
+      mediaProgressSyncer.afterPendingSyncs {
         apiHandler.closePlaybackSession(currentSessionId, config) {
           Log.d(tag, "Closed playback session $currentSessionId")
         }

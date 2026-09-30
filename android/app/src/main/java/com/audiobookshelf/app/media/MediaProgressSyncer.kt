@@ -10,11 +10,13 @@ import com.audiobookshelf.app.device.DeviceManager
 import com.audiobookshelf.app.player.PlayerNotificationService
 import com.audiobookshelf.app.plugins.AbsLogger
 import com.audiobookshelf.app.server.ApiHandler
+import com.audiobookshelf.app.server.RequestCancellation
 import java.util.*
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.schedule
 import kotlin.coroutines.resume
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -41,7 +43,8 @@ sealed class SyncRequest {
   data class Server(
           override val sessionId: String,
           val syncData: MediaProgressSyncData,
-          override val displayTitle: String
+          override val displayTitle: String,
+          val seq: Long = 0 // Order of queueing, the newer seq is kept when merging
   ) : SyncRequest() {
     override val currentTime
       get() = syncData.currentTime
@@ -82,15 +85,18 @@ class MediaProgressSyncer(
         private val apiHandler: ApiHandler
 ) {
   private val tag = "MediaProgressSync"
-  private val SYNC_REQUEST_TIMEOUT_MS = 60000L
+  // OkHttp's default connect/read/write timeouts are 10s each, so this only ends a stuck request
+  private val SYNC_REQUEST_TIMEOUT_MS = 30000L
   private val METERED_CONNECTION_SYNC_INTERVAL = 60000
 
   private var listeningTimerTask: TimerTask? = null
   var listeningTimerRunning: Boolean = false
 
   private var lastSyncTime: Long = 0
-  private var failedSyncs: Int = 0
+  @Volatile private var failedSyncs: Int = 0
   private val unsyncedListeningTime = AtomicLong(0) // seconds from failed server syncs
+
+  private val latestServerSyncSeq = AtomicLong(0)
 
   /**
    * Current time the server confirmed for the current session, or null while a sync is pending or
@@ -109,9 +115,15 @@ class MediaProgressSyncer(
                   CoroutineScope(SupervisorJob() + Dispatchers.IO),
                   SyncRequest::merge,
                   ::sendSyncRequest
-          )
+          ) { e -> Log.e(tag, "Progress sync callback failed", e) }
 
-  var currentPlaybackSession: PlaybackSession? = null // copy of pb session currently syncing
+  /**
+   * Runs [action] after all queued syncs completed, right away if none are queued. Used to close
+   * the session on the server only after the final position has been sent.
+   */
+  fun afterPendingSyncs(action: () -> Unit) = syncQueue.whenIdle(action)
+
+  @Volatile var currentPlaybackSession: PlaybackSession? = null // copy of pb session currently syncing
   var currentLocalMediaProgress: LocalMediaProgress? = null
 
   private val currentDisplayTitle
@@ -132,14 +144,13 @@ class MediaProgressSyncer(
         listeningTimerTask?.cancel()
         lastSyncTime = 0L
         Log.d(tag, "start: Set last sync time 0 $lastSyncTime")
-        failedSyncs = 0
-        unsyncedListeningTime.set(0)
-        confirmedServerTime = null
+        resetSessionSyncState()
       } else {
         return
       }
     } else if (playbackSession.id != currentSessionId) {
       currentLocalMediaProgress = null
+      resetSessionSyncState()
     }
 
     listeningTimerRunning = true
@@ -190,7 +201,8 @@ class MediaProgressSyncer(
   fun stop(shouldSync: Boolean? = true, cb: () -> Unit) {
     if (!listeningTimerRunning) {
       reset()
-      return cb()
+      // The pause sync may still be queued; callers close or replace the session in cb
+      return afterPendingSyncs(cb)
     }
 
     listeningTimerTask?.cancel()
@@ -277,6 +289,9 @@ class MediaProgressSyncer(
   }
 
   fun seek() {
+    // A seek while paused picks the position to resume from (the user, or the webview applying
+    // server progress), so the progress check on resume must not override it
+    if (!playerNotificationService.currentPlayer.isPlaying) pausedAt = 0L
     currentPlaybackSession?.currentTime = playerNotificationService.getCurrentTimeSeconds()
     Log.d(tag, "seek: $currentDisplayTitle, currentTime=${currentPlaybackSession?.currentTime}")
 
@@ -367,7 +382,13 @@ class MediaProgressSyncer(
       lastSyncTime += listeningTimeToAdd * 1000L
       val requestSyncData =
               syncData.copy(timeListened = listeningTimeToAdd + unsyncedListeningTime.getAndSet(0))
-      val request = SyncRequest.Server(currentSessionId, requestSyncData, currentDisplayTitle)
+      val request =
+              SyncRequest.Server(
+                      currentSessionId,
+                      requestSyncData,
+                      currentDisplayTitle,
+                      latestServerSyncSeq.incrementAndGet()
+              )
       confirmedServerTime = null
       AbsLogger.info("MediaProgressSyncer", "sync: Queue progress sync to server (title: \"$currentDisplayTitle\") (currentTime: $currentTime) (session id: ${request.sessionId}) (${DeviceManager.serverConnectionConfigName})")
 
@@ -378,19 +399,34 @@ class MediaProgressSyncer(
     }
   }
 
-  /** Runs on the sync queue, one request at a time. */
+  /** Runs on the sync queue, one request at a time. Never throws, so callbacks always run. */
   private suspend fun sendSyncRequest(request: SyncRequest): SyncResult {
+    return try {
+      sendSyncRequestOrThrow(request)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      AbsLogger.error("MediaProgressSyncer", "sync: Error sending progress sync (session id: ${request.sessionId}) (${e.message})")
+      SyncResult(true, false, e.message)
+    }
+  }
+
+  private suspend fun sendSyncRequestOrThrow(request: SyncRequest): SyncResult {
     // The timeout guards the queue: if a callback is ever lost, later syncs must not wait forever
     val (syncSuccess, errorMsg) =
             withTimeoutOrNull(SYNC_REQUEST_TIMEOUT_MS) {
               suspendCancellableCoroutine<Pair<Boolean, String?>> { cont ->
+                // Cancel the HTTP call on timeout. Otherwise a stalled request could still reach the
+                // server after the next queued sync and overwrite it with an older position.
+                val cancellation = RequestCancellation()
+                cont.invokeOnCancellation { cancellation.cancel() }
                 when (request) {
                   is SyncRequest.Server ->
-                          apiHandler.sendProgressSync(request.sessionId, request.syncData) { success, error ->
+                          apiHandler.sendProgressSync(request.sessionId, request.syncData, cancellation) { success, error ->
                             cont.resume(success to error)
                           }
                   is SyncRequest.Local ->
-                          apiHandler.sendLocalProgressSync(request.session) { success, error ->
+                          apiHandler.sendLocalProgressSync(request.session, cancellation) { success, error ->
                             cont.resume(success to error)
                           }
                 }
@@ -398,7 +434,10 @@ class MediaProgressSyncer(
             } ?: (false to "Sync request timed out")
 
     val sessionId = request.sessionId
-    if (request is SyncRequest.Server && sessionId == currentSessionId) {
+    if (request is SyncRequest.Server &&
+                    sessionId == currentSessionId &&
+                    request.seq == latestServerSyncSeq.get()
+    ) {
       confirmedServerTime = if (syncSuccess) request.currentTime else null
     }
     if (syncSuccess) {
@@ -446,6 +485,14 @@ class MediaProgressSyncer(
         )
       }
     }
+  }
+
+  /** Sync state that belongs to one playback session and must not carry over to the next */
+  private fun resetSessionSyncState() {
+    failedSyncs = 0
+    unsyncedListeningTime.set(0)
+    confirmedServerTime = null
+    pausedAt = 0L
   }
 
   private fun resetOnce(): () -> Unit {
