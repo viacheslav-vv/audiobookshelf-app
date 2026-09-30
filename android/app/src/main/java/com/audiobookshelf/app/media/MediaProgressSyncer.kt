@@ -19,6 +19,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 
 data class MediaProgressSyncData(
         var timeListened: Long, // seconds
@@ -81,6 +82,7 @@ class MediaProgressSyncer(
         private val apiHandler: ApiHandler
 ) {
   private val tag = "MediaProgressSync"
+  private val SYNC_REQUEST_TIMEOUT_MS = 60000L
   private val METERED_CONNECTION_SYNC_INTERVAL = 60000
 
   private var listeningTimerTask: TimerTask? = null
@@ -378,19 +380,22 @@ class MediaProgressSyncer(
 
   /** Runs on the sync queue, one request at a time. */
   private suspend fun sendSyncRequest(request: SyncRequest): SyncResult {
+    // The timeout guards the queue: if a callback is ever lost, later syncs must not wait forever
     val (syncSuccess, errorMsg) =
-            suspendCancellableCoroutine<Pair<Boolean, String?>> { cont ->
-              when (request) {
-                is SyncRequest.Server ->
-                        apiHandler.sendProgressSync(request.sessionId, request.syncData) { success, error ->
-                          cont.resume(success to error)
-                        }
-                is SyncRequest.Local ->
-                        apiHandler.sendLocalProgressSync(request.session) { success, error ->
-                          cont.resume(success to error)
-                        }
+            withTimeoutOrNull(SYNC_REQUEST_TIMEOUT_MS) {
+              suspendCancellableCoroutine<Pair<Boolean, String?>> { cont ->
+                when (request) {
+                  is SyncRequest.Server ->
+                          apiHandler.sendProgressSync(request.sessionId, request.syncData) { success, error ->
+                            cont.resume(success to error)
+                          }
+                  is SyncRequest.Local ->
+                          apiHandler.sendLocalProgressSync(request.session) { success, error ->
+                            cont.resume(success to error)
+                          }
+                }
               }
-            }
+            } ?: (false to "Sync request timed out")
 
     val sessionId = request.sessionId
     if (request is SyncRequest.Server && sessionId == currentSessionId) {

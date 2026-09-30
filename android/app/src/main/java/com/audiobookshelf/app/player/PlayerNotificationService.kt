@@ -77,6 +77,8 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
 
     // Shorter pauses resume right away without asking the server for progress from other devices
     private const val MIN_PAUSE_BEFORE_PROGRESS_CHECK_MS = 5000L
+    // Server progress request times out after 3s, so this only triggers if its callback never comes
+    private const val PROGRESS_CHECK_TIMEOUT_MS = 4000L
   }
 
   private val tag = "PlayerNotificationServ"
@@ -797,6 +799,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
   }
 
   private var playRequestId = 0
+  private var progressCheckPending = false
 
   fun getCurrentTime(): Long {
     return currentPlayer.currentPosition + getCurrentTrackStartOffsetMs()
@@ -965,6 +968,7 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
 
   fun pause() {
     playRequestId++ // Cancels a play waiting on checkServerProgressBeforePlay
+    progressCheckPending = false
     currentPlayer.pause()
   }
 
@@ -992,29 +996,48 @@ class PlayerNotificationService : MediaBrowserServiceCompat() {
       return false
     }
 
+    if (progressCheckPending) return true // Playback starts when the running check completes
+
     AbsLogger.info("PlayerNotificationService", "checkServerProgressBeforePlay: Checking server progress before resuming (title: \"${playbackSession.displayTitle}\")")
     val requestId = ++playRequestId
-    apiHandler.getMediaProgress(libraryItemId, playbackSession.episodeId, null) { mediaProgress ->
-      Handler(Looper.getMainLooper()).post {
-        if (requestId != playRequestId || currentPlayer.isPlaying) return@post // Paused again meanwhile
+    progressCheckPending = true
+    val mainHandler = Handler(Looper.getMainLooper())
+    var handled = false
 
-        val confirmedTime = mediaProgressSyncer.confirmedServerTime
+    // Runs on the main thread, once: when the server answers or when the fallback timeout fires
+    val finish = finish@{ mediaProgress: MediaProgress?, timedOut: Boolean ->
+      if (handled) return@finish
+      handled = true
+      if (requestId != playRequestId) return@finish // Paused (or another play started) meanwhile
+      progressCheckPending = false
+      if (currentPlayer.isPlaying) return@finish
+
+      val confirmedTime = mediaProgressSyncer.confirmedServerTime
+      if (timedOut) {
+        AbsLogger.info("PlayerNotificationService", "checkServerProgressBeforePlay: No server response in time, playing from current position")
+      } else {
         AbsLogger.info("PlayerNotificationService", "checkServerProgressBeforePlay: Server progress ${mediaProgress?.currentTime} (lastUpdate ${mediaProgress?.lastUpdate}), last synced by this device $confirmedTime, player at ${getCurrentTimeSeconds()}")
-        if (mediaProgress != null &&
-                        confirmedTime != null &&
-                        !mediaProgress.isFinished &&
-                        mediaProgressSyncer.currentSessionId == playbackSession.id &&
-                        abs(mediaProgress.currentTime - confirmedTime) > 1.0
-        ) {
-          AbsLogger.info("PlayerNotificationService", "checkServerProgressBeforePlay: Progress changed on another device from $confirmedTime to ${mediaProgress.currentTime}, seeking before play (title: \"${playbackSession.displayTitle}\")")
-          seekPlayer((mediaProgress.currentTime * 1000).toLong())
-        } else if (mediaProgress == null) {
-          AbsLogger.info("PlayerNotificationService", "checkServerProgressBeforePlay: Could not get server progress, playing from current position")
-        }
-
-        currentPlayer.volume = 1F
-        currentPlayer.play()
       }
+      if (mediaProgress != null &&
+                      confirmedTime != null &&
+                      !mediaProgress.isFinished &&
+                      mediaProgressSyncer.currentSessionId == playbackSession.id &&
+                      abs(mediaProgress.currentTime - confirmedTime) > 1.0
+      ) {
+        AbsLogger.info("PlayerNotificationService", "checkServerProgressBeforePlay: Progress changed on another device from $confirmedTime to ${mediaProgress.currentTime}, seeking before play (title: \"${playbackSession.displayTitle}\")")
+        seekPlayer((mediaProgress.currentTime * 1000).toLong())
+      } else if (mediaProgress == null && !timedOut) {
+        AbsLogger.info("PlayerNotificationService", "checkServerProgressBeforePlay: Could not get server progress, playing from current position")
+      }
+
+      currentPlayer.volume = 1F
+      currentPlayer.play()
+    }
+
+    // Never leave the user waiting on the network: play anyway if the server is slow to answer
+    mainHandler.postDelayed({ finish(null, true) }, PROGRESS_CHECK_TIMEOUT_MS)
+    apiHandler.getMediaProgress(libraryItemId, playbackSession.episodeId, null) { mediaProgress ->
+      mainHandler.post { finish(mediaProgress, false) }
     }
     return true
   }

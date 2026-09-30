@@ -139,7 +139,15 @@ class ApiHandler(var ctx:Context) {
             return
           }
 
-          val bodyString = it.body!!.string()
+          // Reading the body can still fail (e.g. call timeout mid-body). An exception here would be
+          // swallowed by OkHttp and cb never called, leaving callers waiting forever.
+          val bodyString = try {
+            it.body!!.string()
+          } catch (e: IOException) {
+            AbsLogger.error(tag, "makeRequest: Failed to read response from \"${request.url.encodedPath}\" (${e.message})")
+            cb(JSObject().put("error", "Failed to read response"))
+            return
+          }
           if (bodyString == "OK") {
             cb(JSObject())
           } else {
@@ -398,7 +406,13 @@ class ApiHandler(var ctx:Context) {
               return
             }
 
-            val bodyString = it.body!!.string()
+            val bodyString = try {
+              it.body!!.string()
+            } catch (e: IOException) {
+              AbsLogger.error(tag, "retryOriginalRequest: Failed to read response (${e.message})")
+              callback(JSObject().put("error", "Failed to read response"))
+              return
+            }
             if (bodyString == "OK") {
               callback(JSObject())
             } else {
